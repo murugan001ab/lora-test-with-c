@@ -1,86 +1,108 @@
 // src/main.cpp
 //
-// Port of p2p/p2p_tx.py.
-// Simple raw LoRa sender. No LoRaWAN, no OTAA, no gateway -- just
-// SX1262 -> SX1262 point-to-point. Sends an incrementing counter packet
-// every few seconds, then listens (continuous RX) for a downlink before
-// repeating -- exactly like the MicroPython original's loop structure
-// (once a downlink has been seen, it stops re-arming continuous RX,
-// mirroring the `if not downlink:` guard from p2p_tx.py).
+// ZWELDAQ ESP32 firmware entry point — wires together the modules below.
+// RFID login/logout + ADS1115/analog sensor sampling + DWIN display +
+// SX1262 LoRa uplink/downlink. Behavior matches the original monolithic
+// zweldaq.cpp (preserved at legacy/zweldaq_monolithic.cpp); this file
+// only reorganizes it into reusable, single-purpose modules.
 //
-// Flash this same build to both boards to test; run a receive-only
-// counterpart if you want a dedicated RX board instead.
+// See legacy/p2p_main.cpp for the earlier raw point-to-point LoRa test
+// sketch this replaced as the active main.cpp.
 
 #include <Arduino.h>
-#include <SPI.h>
-#include "SX1262.h"
-#include "p2p_config.h"
+#include <Wire.h>
 
-static SPIClass radioSpi(VSPI);
-static SX1262 radio(radioSpi, P2P::PIN_CS, P2P::PIN_RESET, P2P::PIN_BUSY,
-                     P2P::PIN_DIO1, P2P::PIN_RXEN, P2P::PIN_TXEN);
+#include "config.h"
+#include "state.h"
+#include "time_utils.h"
+#include "dwin_display.h"
+#include "sensors.h"
+#include "radio_sx1262.h"
+#include "payloads.h"
+#include "rfid_handler.h"
+#include "shutdown_button.h"
 
-static uint32_t counter = 0;
-static bool haveDownlink = false; // mirrors Python's `downlink = ""` falsy check
+void setup()
+{
+  Serial.begin(115200);
+  delay(1000);
 
-void setup() {
-    Serial.begin(115200);
-    delay(1000);
+  Serial.println();
+  Serial.println();
+  Serial.println("========================================");
+  Serial.println("          ZWELDAQ ESP32");
+  Serial.println(" RFID + ADS1115 + DWIN + SX1262");
+  Serial.println("========================================");
 
-    pinMode(P2P::PIN_LED, OUTPUT);
-    digitalWrite(P2P::PIN_LED, HIGH); // off (active-low on most of these boards)
+  // epochBase starts at 0 (1970-01-01) until the server sends a
+  // TIME_SYNC downlink after the device_connect status is received;
+  // see radio_sx1262.cpp's handleDownlink(). Timestamps before that
+  // sync will read as 1970 epoch time.
+  setEpoch(0);
 
-    radioSpi.begin(P2P::PIN_SCK, P2P::PIN_MISO, P2P::PIN_MOSI, P2P::PIN_CS);
-    radio.begin(1000000);
+  pinMode(LED_PIN, OUTPUT);
+  digitalWrite(LED_PIN, LOW);
 
-    radio.initLora();
+  initShutdownButton();
+  RFID_Init();
+  initDwinDisplay();
+
+  Wire.begin();
+  initSensors();
+
+  initRadio();
+  sendDeviceOnline();
+
+  digitalWrite(LED_PIN, HIGH);
+
+  Serial.println();
+  Serial.println("========================================");
+  Serial.println("             SYSTEM READY");
+  Serial.println("========================================");
+  Serial.println("RFID  -> VSPI");
+  Serial.println("LoRa  -> HSPI");
+  Serial.println("ADS1115 -> I2C");
+  Serial.println("DWIN -> UART2");
+  Serial.println("========================================");
 }
 
-void loop() {
-    counter++;
-    char payload[32];
-    int len = snprintf(payload, sizeof(payload), "hello #%lu", (unsigned long)counter);
+void loop()
+{
+  handleRFID();
+  checkAndProcessDownlink();
+  readSensors();
 
-    Serial.printf("[P2P_TX] Sending: %s\n", payload);
+  // ------------------------------------------------------------------
+  // WELDING STATE MACHINE
+  // ------------------------------------------------------------------
 
-    digitalWrite(P2P::PIN_LED, LOW);
+  if (Cal_Current > WELD_CURRENT_THRESHOLD && loggedIn && !weldingStarted)
+  {
+    weldingStarted   = true;
+    lastWeldDataTime = millis();
 
-    bool ok = radio.transmit(
-        (const uint8_t *)payload, len,
-        P2P::FREQ_HZ, P2P::SF, P2P::BW_HZ, P2P::CR, P2P::TX_POWER
-    );
+    sendWeldStart();
+    Serial.println("[SYSTEM] WELDING STARTED");
+  }
 
-    digitalWrite(P2P::PIN_LED, HIGH);
-
-    if (!ok) {
-        Serial.println("[P2P_TX] TX failed.");
-        return; // matches Python's `continue`
+  if (Cal_Current > WELD_CURRENT_THRESHOLD && loggedIn && weldingStarted)
+  {
+    if (millis() - lastWeldDataTime >= WELD_DATA_INTERVAL)
+    {
+      lastWeldDataTime = millis();
+      sendWeldData();
     }
+  }
 
-    Serial.println("[P2P_TX] TX done.");
-    Serial.println("[P2P_TX] Waiting for downlink...");
+  if (Cal_Current <= WELD_CURRENT_THRESHOLD && weldingStarted)
+  {
+    sendWeldStop();
+    weldingStarted = false;
 
-    if (!haveDownlink) {
-        radio.configureRx(P2P::FREQ_HZ, P2P::SF, P2P::BW_HZ, P2P::CR, 64);
-        radio.triggerRxContinuous();
+    Serial.println("[SYSTEM] WELDING STOPPED");
+  }
 
-        while (true) {
-            uint8_t buf[64];
-            uint8_t rxLen = 0;
-            radio.waitForRxContinuous(buf, rxLen); // blocks until a packet arrives
+  checkShutdownButton();
 
-            haveDownlink = true;
-
-            PacketStatus ps = radio.getPacketStatus();
-
-            Serial.printf("[P2P_TX] Downlink (%d bytes): ", rxLen);
-            for (uint8_t i = 0; i < rxLen; i++) Serial.write(buf[i]);
-            Serial.println();
-
-            Serial.printf("[P2P_TX] RSSI=%.1f SNR=%.1f\n", ps.rssi_pkt_dbm, ps.snr_pkt_db);
-            break;
-        }
-    }
-
-    delay(10000);
+  delay(100);
 }
