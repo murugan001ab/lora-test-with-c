@@ -38,3 +38,10 @@ extern float Cal_GasFlow;
 // (time_utils.h) whenever a TIME_SYNC downlink arrives.
 extern unsigned long baseMillis;
 extern unsigned long epochBase;
+
+// Numeric rfid row id (rfids.id) the server acks back after welderlogin
+// (see radio_sx1262.cpp's handleDownlink(), cmd 0x02 RFID_ACK). 0 means
+// "not yet acked" -- reset on every fresh login so a stale id from a
+// previous session is never sent. welder_start echoes this (not
+// currentRFID) back to the server.
+extern uint32_t currentRfidId;

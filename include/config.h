@@ -95,7 +95,7 @@
 const unsigned long SHUTDOWN_HOLD_MS   = 2000;
 const unsigned long RFID_DEBOUNCE      = 800;
 const unsigned long WELD_DATA_INTERVAL = 3000;
-const float WELD_CURRENT_THRESHOLD     = 10.0f;
+const float WELD_CURRENT_THRESHOLD     = 1.0f;  // TEMP: bench test only -- set back to 10.0f (or real min arc current) before field use
 
 // ================================================================
 //                       SENSOR CALIBRATION

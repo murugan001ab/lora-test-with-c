@@ -18,3 +18,5 @@ float Cal_GasFlow  = 0.0;
 
 unsigned long baseMillis = 0;
 unsigned long epochBase  = 0;
+
+uint32_t currentRfidId = 0;

@@ -100,7 +100,11 @@ void sendWeldStart()
   doc["deviceId"]        = String(DEVICE_ID);
   doc["time"]            = getTimestamp();
   doc["organization_id"] = ORGANIZATION_ID;
-  doc["rfid"]            = currentRFID;
+  // Numeric rfid row id acked back by the server after welderlogin (see
+  // radio_sx1262.cpp's handleDownlink(), cmd 0x02) -- NOT the raw card
+  // UID string in currentRFID. Stays 0 if welding starts before the ack
+  // arrives.
+  doc["rfid"]            = currentRfidId;
 
   String payload;
   serializeJson(doc, payload);

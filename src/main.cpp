@@ -11,6 +11,7 @@
 
 #include <Arduino.h>
 #include <Wire.h>
+#include <esp_system.h>
 
 #include "config.h"
 #include "state.h"
@@ -22,10 +23,41 @@
 #include "rfid_handler.h"
 #include "shutdown_button.h"
 
+static void printResetReason()
+{
+  // Prints WHY the ESP32 just booted -- lets us tell a normal
+  // power-on/flash apart from a brownout (power supply sagging under
+  // load, e.g. LoRa TX current draw) or a watchdog timeout (something
+  // in loop() blocked too long) the next time this happens, instead of
+  // guessing from a garbled ROM banner alone.
+  esp_reset_reason_t reason = esp_reset_reason();
+  const char *reasonStr;
+
+  switch (reason)
+  {
+    case ESP_RST_POWERON:   reasonStr = "POWERON (normal power-up)"; break;
+    case ESP_RST_EXT:       reasonStr = "EXT (external reset pin)"; break;
+    case ESP_RST_SW:        reasonStr = "SW (esp_restart() called)"; break;
+    case ESP_RST_PANIC:     reasonStr = "PANIC (exception/crash!)"; break;
+    case ESP_RST_INT_WDT:   reasonStr = "INT_WDT (interrupt watchdog -- code blocked too long in an ISR)"; break;
+    case ESP_RST_TASK_WDT:  reasonStr = "TASK_WDT (task watchdog -- loop() blocked too long)"; break;
+    case ESP_RST_WDT:       reasonStr = "WDT (other watchdog)"; break;
+    case ESP_RST_DEEPSLEEP: reasonStr = "DEEPSLEEP wake"; break;
+    case ESP_RST_BROWNOUT:  reasonStr = "BROWNOUT (supply voltage sagged below threshold!)"; break;
+    case ESP_RST_SDIO:      reasonStr = "SDIO"; break;
+    default:                reasonStr = "UNKNOWN"; break;
+  }
+
+  Serial.print("[BOOT] Reset reason: ");
+  Serial.println(reasonStr);
+}
+
 void setup()
 {
   Serial.begin(115200);
   delay(1000);
+
+  printResetReason();
 
   Serial.println();
   Serial.println();
@@ -43,15 +75,19 @@ void setup()
   pinMode(LED_PIN, OUTPUT);
   digitalWrite(LED_PIN, LOW);
 
-  initShutdownButton();
-  RFID_Init();
-  initDwinDisplay();
-
   Wire.begin();
   initSensors();
 
+  // NOTE: DWIN intentionally NOT initialized here yet.
+  // This build sends the initial device_connect payload, waits for
+  // downlinks, handles RFID login/logout uplinks, and now also runs
+  // the weld start/stop/data state machine driven by Cal_Current.
   initRadio();
   sendDeviceOnline();
+
+  RFID_Init();
+
+  initShutdownButton();
 
   digitalWrite(LED_PIN, HIGH);
 
@@ -68,41 +104,52 @@ void setup()
 
 void loop()
 {
-  handleRFID();
+  // Wait for downlinks (TIME_SYNC / RFID_ACK) and watch for RFID card
+  // taps (welderlogin/welderlogout uplinks), and for the shutdown button
+  // being held (graceful power-down: closes out any open weld/login
+  // before sending device_status offline and sleeping).
   checkAndProcessDownlink();
-  readSensors();
+  handleRFID();
+  checkShutdownButton();
 
-  // ------------------------------------------------------------------
-  // WELDING STATE MACHINE
-  // ------------------------------------------------------------------
-
-  if (Cal_Current > WELD_CURRENT_THRESHOLD && loggedIn && !weldingStarted)
+  // Weld start/stop/data state machine -- only runs once an operator is
+  // logged in. Cal_Current crossing WELD_CURRENT_THRESHOLD (config.h) is
+  // what welder_start/welder_stop are keyed off; while welding is active,
+  // welder_data goes out every WELD_DATA_INTERVAL ms (also config.h).
+  if (loggedIn)
   {
-    weldingStarted   = true;
-    lastWeldDataTime = millis();
+    readSensors();
 
-    sendWeldStart();
-    Serial.println("[SYSTEM] WELDING STARTED");
-  }
-
-  if (Cal_Current > WELD_CURRENT_THRESHOLD && loggedIn && weldingStarted)
-  {
-    if (millis() - lastWeldDataTime >= WELD_DATA_INTERVAL)
+    if (!weldingStarted)
     {
-      lastWeldDataTime = millis();
-      sendWeldData();
+      if (Cal_Current > WELD_CURRENT_THRESHOLD)
+      {
+        weldingStarted   = true;
+        lastWeldDataTime = millis();
+
+        sendWeldStart();
+
+        Serial.println("[SYSTEM] WELDING STARTED");
+      }
+    }
+    else
+    {
+      if (Cal_Current <= WELD_CURRENT_THRESHOLD)
+      {
+        weldingStarted = false;
+
+        sendWeldStop();
+
+        Serial.println("[SYSTEM] WELDING STOPPED");
+      }
+      else if (millis() - lastWeldDataTime >= WELD_DATA_INTERVAL)
+      {
+        lastWeldDataTime = millis();
+
+        sendWeldData();
+      }
     }
   }
-
-  if (Cal_Current <= WELD_CURRENT_THRESHOLD && weldingStarted)
-  {
-    sendWeldStop();
-    weldingStarted = false;
-
-    Serial.println("[SYSTEM] WELDING STOPPED");
-  }
-
-  checkShutdownButton();
 
   delay(100);
 }

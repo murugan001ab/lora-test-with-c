@@ -105,6 +105,10 @@ void handleRFID()
     loggedIn       = true;
     systemState    = LOGGED_IN;
     weldingStarted = false;
+    // Cleared here, not just after logout: guards against a leftover id
+    // from a previous session being sent if welding starts before this
+    // session's RFID_ACK downlink arrives.
+    currentRfidId  = 0;
 
     sendLogin(currentRFID);
 
@@ -127,6 +131,7 @@ void handleRFID()
     weldingStarted = false;
     currentRFID    = "";
     sessionID      = "";
+    currentRfidId  = 0;
     systemState    = IDLE;
 
     Serial.println("[SYSTEM] OPERATOR LOGGED OUT");

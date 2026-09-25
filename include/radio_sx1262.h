@@ -25,5 +25,6 @@ bool sendLoRa(const String &payload);
 
 // Non-blocking — call every loop() iteration. If a downlink packet has
 // arrived, reads it, dispatches it (currently: 0x01 TIME_SYNC, 4-byte
-// big-endian Unix epoch seconds), and leaves the radio listening.
+// big-endian Unix epoch seconds; 0x02 RFID_ACK, 4-byte big-endian rfid
+// row id sent after a welderlogin), and leaves the radio listening.
 void checkAndProcessDownlink();

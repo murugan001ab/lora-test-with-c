@@ -1,5 +1,6 @@
 #include "radio_sx1262.h"
 #include "config.h"
+#include "state.h"
 #include "time_utils.h"
 
 #include <SPI.h>
@@ -27,6 +28,10 @@ static const uint8_t CMD_DIO2_RF_SWITCH       = 0x9D;
 static const uint8_t CMD_GET_STATUS           = 0xC0;
 static const uint8_t CMD_SET_DIO3_TCXO_CTRL   = 0x97;
 static const uint8_t CMD_CALIBRATE            = 0x89;
+static const uint8_t CMD_CALIBRATE_IMAGE      = 0x98;
+static const uint8_t CMD_WRITE_REGISTER       = 0x0D;
+static const uint8_t CMD_SET_REGULATOR_MODE   = 0x96;
+static const uint16_t REG_LORA_SYNC_WORD_MSB  = 0x0740;
 
 static const uint16_t IRQ_TX_DONE   = 0x0001;
 static const uint16_t IRQ_RX_DONE   = 0x0002;
@@ -157,11 +162,12 @@ static void setDio3AsTcxoCtrl()
   // Voltage byte per SX126x datasheet Table 13-38:
   //   0x00=1.6V 0x01=1.7V 0x02=1.8V 0x03=2.2V
   //   0x04=2.4V 0x05=2.7V 0x06=3.0V 0x07=3.3V
-  // TODO: verify against your exact Ebyte module datasheet -- wrong
-  // voltage can damage the TCXO. 3.3V (0x07) is used here as the most
-  // common value for Ebyte E22 modules; confirm before relying on it.
+  // Confirmed 1.8V against the same Ebyte E22-900M22S module in the
+  // known-working lora-test-with-c reference driver (which reaches
+  // the Kerlink gateway successfully) -- do not change without
+  // re-verifying against that reference or the module's datasheet.
   uint8_t data[4];
-  data[0] = 0x07;              // TCXO supply voltage = 3.3V
+  data[0] = 0x02;               // TCXO supply voltage = 1.8V
   uint32_t delay = 320;        // startup delay, units of 15.625 us (~5 ms)
   data[1] = (delay >> 16) & 0xFF;
   data[2] = (delay >> 8) & 0xFF;
@@ -175,6 +181,43 @@ static void calibrate()
   uint8_t data = 0x7F; // calibrate all blocks (RC64k, RC13M, PLL, ADC, IMG)
   writeCommand(CMD_CALIBRATE, &data, 1);
   delay(10); // datasheet: allow calibration to finish before next command
+}
+
+static void calibrateImage863to870()
+{
+  // CalibrateFunction's generic pass above only calibrates image
+  // rejection for the chip's factory-default band (902-928 MHz /
+  // US915). Our actual TX band is 863-870 MHz (IN865/EU868), so we
+  // must explicitly calibrate image rejection for THIS band too, or
+  // RX sensitivity in that band is degraded. Byte pair per SX1261/2
+  // datasheet section 9.2.1.
+  uint8_t data[2] = { 0xD7, 0xDB };
+  writeCommand(CMD_CALIBRATE_IMAGE, data, 2);
+  waitBusy();
+}
+
+static void setRegulatorModeDCDC()
+{
+  uint8_t data = 0x01; // DC-DC (recommended over LDO when available)
+  writeCommand(CMD_SET_REGULATOR_MODE, &data, 1);
+}
+
+static void setSyncWordPublic()
+{
+  // The SX1262 defaults to the PRIVATE LoRa sync word (0x1424) on
+  // reset. A LoRaWAN-style gateway packet forwarder (Kerlink/lorad,
+  // ChirpStack, TTN, etc.) only recognizes the PUBLIC sync word
+  // (0x3444) as a valid LoRa preamble -- with the wrong sync word the
+  // gateway silently never sees the packet at the PHY layer at all,
+  // even though the ESP32 itself reports TX DONE successfully. This
+  // was confirmed working against the same Kerlink gateway in the
+  // lora-test-with-c reference driver.
+  uint8_t data[4] = {
+    (uint8_t)((REG_LORA_SYNC_WORD_MSB >> 8) & 0xFF),
+    (uint8_t)(REG_LORA_SYNC_WORD_MSB & 0xFF),
+    0x34, 0x44 // public sync word
+  };
+  writeCommand(CMD_WRITE_REGISTER, data, 4);
 }
 
 static void setPacketTypeLoRa()
@@ -207,13 +250,21 @@ static void setModulation()
   writeCommand(CMD_SET_MODULATION, data, 4);
 }
 
-static void setPacketParameters()
+static void setPacketParameters(uint8_t payloadLength)
 {
+  // payloadLength = the actual number of bytes the radio will transmit
+  // (TX) from the buffer, or the max buffer size to allocate (RX --
+  // the real received length comes from GetRxBufferStatus afterward,
+  // so 0xFF/255 is safe there). This MUST be set to the real message
+  // length before every TX call in explicit-header mode, or the SX1262
+  // transmits stale/garbage buffer bytes past the real payload,
+  // producing a corrupted, oversized packet that the gateway's CRC
+  // check silently drops -- even though TxDone still fires locally.
   uint8_t data[6];
   data[0] = 0x00; // preamble = 8
   data[1] = 0x08;
   data[2] = 0x00; // explicit header
-  data[3] = 0xFF; // variable payload
+  data[3] = payloadLength;
   data[4] = 0x01; // CRC ON
   data[5] = 0x00; // normal IQ
 
@@ -329,6 +380,7 @@ static void resumeListening()
   digitalWrite(LORA_RXEN, HIGH);
   delay(2);
 
+  setPacketParameters(0xFF); // back to RX max -- real length comes from GetRxBufferStatus
   startRX();
 }
 
@@ -337,13 +389,21 @@ static void configureRadio()
   Serial.println();
   Serial.println("========== SX1262 CONFIG ==========");
 
-  setStandby();
+  setRegulatorModeDCDC();
+  // Chip is already in default STDBY_RC immediately after reset, so
+  // TCXO setup + calibration happen here BEFORE requesting STDBY_XOSC --
+  // asking the chip to switch to the crystal/TCXO clock before it even
+  // knows the TCXO exists (voltage/startup delay) is out of datasheet
+  // order and was a bug here previously.
   setDio3AsTcxoCtrl();
   calibrate();
+  calibrateImage863to870();
+  setStandby();
   setPacketTypeLoRa();
+  setSyncWordPublic();
   setFrequency(LORA_FREQ);
   setModulation();
-  setPacketParameters();
+  setPacketParameters(0xFF); // RX default: max buffer, actual length read via GetRxBufferStatus
   setBufferBase();
   setPAConfig();
   setTxParams();
@@ -365,17 +425,39 @@ static void configureRadio()
 //
 // Protocol: 1 byte command + payload
 //   0x01 TIME_SYNC : 4 bytes big-endian Unix epoch seconds
+//   0x02 RFID_ACK  : 4 bytes big-endian rfid row id (rfids.id), sent by
+//                    the server in response to a welderlogin uplink
 // ================================================================
+
+static void printDownlinkHex(const uint8_t *payload, uint8_t length)
+{
+  // Raw byte dump of every downlink, before it's interpreted -- lets us
+  // see exactly what arrived over RF (e.g. to cross-check against the
+  // base64 phyPayload the network server/gateway bridge logged for this
+  // same downlink) even if handleDownlink() below doesn't recognize it.
+  Serial.print("[LoRa] Downlink raw bytes (hex): ");
+  for (uint8_t i = 0; i < length; i++)
+  {
+    if (payload[i] < 0x10) Serial.print("0");
+    Serial.print(payload[i], HEX);
+    Serial.print(" ");
+  }
+  Serial.println();
+}
+
+static uint32_t readUint32BE(uint8_t *payload)
+{
+  return ((uint32_t)payload[1] << 24) |
+         ((uint32_t)payload[2] << 16) |
+         ((uint32_t)payload[3] << 8)  |
+          (uint32_t)payload[4];
+}
 
 static void handleDownlink(uint8_t *payload, uint8_t length)
 {
   if (length >= 5 && payload[0] == 0x01)
   {
-    uint32_t epoch =
-      ((uint32_t)payload[1] << 24) |
-      ((uint32_t)payload[2] << 16) |
-      ((uint32_t)payload[3] << 8)  |
-       (uint32_t)payload[4];
+    uint32_t epoch = readUint32BE(payload);
 
     setEpoch(epoch);
 
@@ -384,6 +466,13 @@ static void handleDownlink(uint8_t *payload, uint8_t length)
 
     Serial.print("[TIME SYNC] Current time: ");
     Serial.println(getTimestamp());
+  }
+  else if (length >= 5 && payload[0] == 0x02)
+  {
+    currentRfidId = readUint32BE(payload);
+
+    Serial.print("[RFID ACK] rfid id set to: ");
+    Serial.println(currentRfidId);
   }
   else
   {
@@ -447,6 +536,7 @@ bool sendLoRa(const String &payload)
 
   setStandby();
   clearIRQ();
+  setPacketParameters((uint8_t)payload.length()); // real length for THIS packet -- see note above
   writePayload(payload);
   startTX();
 
@@ -514,6 +604,7 @@ void checkAndProcessDownlink()
     Serial.print("[LoRa] Downlink received, length=");
     Serial.println(payloadLength);
 
+    printDownlinkHex(buffer, payloadLength);
     handleDownlink(buffer, payloadLength);
 
     resumeListening();
