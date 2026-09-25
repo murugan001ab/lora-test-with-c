@@ -24,6 +24,9 @@ static const uint8_t CMD_SET_IRQ              = 0x08;
 static const uint8_t CMD_SET_TX_PARAMS        = 0x8E;
 static const uint8_t CMD_SET_PA_CONFIG        = 0x95;
 static const uint8_t CMD_DIO2_RF_SWITCH       = 0x9D;
+static const uint8_t CMD_GET_STATUS           = 0xC0;
+static const uint8_t CMD_SET_DIO3_TCXO_CTRL   = 0x97;
+static const uint8_t CMD_CALIBRATE            = 0x89;
 
 static const uint16_t IRQ_TX_DONE   = 0x0001;
 static const uint16_t IRQ_RX_DONE   = 0x0002;
@@ -144,6 +147,36 @@ static void radioReset()
   Serial.println("[SX1262] Reset complete");
 }
 
+static void setDio3AsTcxoCtrl()
+{
+  // Ebyte SX1262 modules run off a TCXO powered via the chip's DIO3
+  // pin, enabled purely by this SPI command (no ESP32 GPIO involved).
+  // Without this, the oscillator may never start reliably -> every RF
+  // command still "works" over SPI but TX/RX never actually completes.
+  //
+  // Voltage byte per SX126x datasheet Table 13-38:
+  //   0x00=1.6V 0x01=1.7V 0x02=1.8V 0x03=2.2V
+  //   0x04=2.4V 0x05=2.7V 0x06=3.0V 0x07=3.3V
+  // TODO: verify against your exact Ebyte module datasheet -- wrong
+  // voltage can damage the TCXO. 3.3V (0x07) is used here as the most
+  // common value for Ebyte E22 modules; confirm before relying on it.
+  uint8_t data[4];
+  data[0] = 0x07;              // TCXO supply voltage = 3.3V
+  uint32_t delay = 320;        // startup delay, units of 15.625 us (~5 ms)
+  data[1] = (delay >> 16) & 0xFF;
+  data[2] = (delay >> 8) & 0xFF;
+  data[3] = delay & 0xFF;
+
+  writeCommand(CMD_SET_DIO3_TCXO_CTRL, data, 4);
+}
+
+static void calibrate()
+{
+  uint8_t data = 0x7F; // calibrate all blocks (RC64k, RC13M, PLL, ADC, IMG)
+  writeCommand(CMD_CALIBRATE, &data, 1);
+  delay(10); // datasheet: allow calibration to finish before next command
+}
+
 static void setPacketTypeLoRa()
 {
   uint8_t data[1] = { 0x01 };
@@ -244,6 +277,21 @@ static uint16_t getIRQ()
   return ((uint16_t)data[0] << 8) | data[1];
 }
 
+static uint8_t getStatus()
+{
+  // GetStatus (0xC0) returns one status byte on the FIRST byte
+  // clocked back (the NOP response), bits [6:4] = chip mode:
+  //   2 = STBY_RC   3 = STBY_XOSC   4 = FS   5 = RX   6 = TX
+  waitBusy();
+  radioSPI.beginTransaction(radioSPISettings);
+  loraSelect();
+  uint8_t status = radioSPI.transfer(CMD_GET_STATUS);
+  radioSPI.transfer(0x00);
+  loraDeselect();
+  radioSPI.endTransaction();
+  return (status >> 4) & 0x07;
+}
+
 static void writePayload(const String &payload)
 {
   waitBusy();
@@ -290,6 +338,8 @@ static void configureRadio()
   Serial.println("========== SX1262 CONFIG ==========");
 
   setStandby();
+  setDio3AsTcxoCtrl();
+  calibrate();
   setPacketTypeLoRa();
   setFrequency(LORA_FREQ);
   setModulation();
@@ -401,10 +451,18 @@ bool sendLoRa(const String &payload)
   startTX();
 
   unsigned long start = millis();
+  unsigned long lastStatusPrint = 0;
 
   while (millis() - start < 5000)
   {
     uint16_t irq = getIRQ();
+
+    if (millis() - lastStatusPrint > 500)
+    {
+      lastStatusPrint = millis();
+      Serial.print("[LoRa] chip mode while waiting = ");
+      Serial.println(getStatus());
+    }
 
     if (irq & IRQ_TX_DONE)
     {
