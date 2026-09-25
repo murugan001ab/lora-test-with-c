@@ -68,7 +68,14 @@
 // ================================================================
 //                       LORA RF PARAMETERS
 // ================================================================
+// LORA_FREQ is overridable per-device from platformio.ini's per-env
+// build_flags (-D LORA_FREQ=xxxUL), same pattern as DEVICE_ID above.
+// Needed because the Kerlink gateway has 8 channels -- each physical
+// device can be pinned to a different channel frequency this way.
+#ifndef LORA_FREQ
 #define LORA_FREQ        865232500UL
+#endif
+
 #define LORA_SF          7
 #define LORA_BW          125000UL
 #define LORA_CR          1        // 4/5
